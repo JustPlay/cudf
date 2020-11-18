@@ -140,6 +140,7 @@ public class HostMemoryBuffer extends MemoryBuffer {
       if (pinnedBuffer != null) {
         return pinnedBuffer;
       }
+      log.info("Failed to allocate pinned host memory, will fallback to allocate {} bytes pageable host memory", bytes);
     }
     return new HostMemoryBuffer(UnsafeMemoryAccessor.allocate(bytes), bytes);
   }

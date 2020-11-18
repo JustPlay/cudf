@@ -26,6 +26,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.util.Optional;
+import java.util.ArrayList;
 
 /**
  * Deserialize CUDF tables on HOST (not using GPU)
@@ -258,7 +259,7 @@ public class HostDeserialization {
             data = combinedBufferOnHost.slice(offsetInfo.data, offsetInfo.dataLen);
           }
 
-          vectors[column] = new HostColumnVector(type, numRows, Optional.of(nullCount), data, validity, offsets, null);
+          vectors[column] = new HostColumnVector(type, numRows, Optional.of(nullCount), data, validity, offsets, new ArrayList<>());
           validity = null;
           data = null;
           offsets = null;
@@ -342,13 +343,12 @@ public class HostDeserialization {
     if (!header.initialized) {
       return new TableAndRowCountPair(0, null);
     }
-
-    try (HostMemoryBuffer hostBuffer = HostMemoryBuffer.allocate(header.dataLen)) {
-      if (header.dataLen > 0) {
-        readTableIntoBuffer(din, header, hostBuffer);
-      }
-      return readTableFrom(header, hostBuffer);
+    
+    HostMemoryBuffer hostBuffer = HostMemoryBuffer.allocate(header.dataLen);
+    if (header.dataLen > 0) {
+      readTableIntoBuffer(din, header, hostBuffer);
     }
+    return readTableFrom(header, hostBuffer);
   }
 
   /** 
