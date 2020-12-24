@@ -17,6 +17,7 @@
 package ai.rapids.cudf;
 
 import java.util.Arrays;
+import java.util.Optional;
 
 /**
  * Class to represent a collection of HostColumnVector(s)
@@ -101,5 +102,162 @@ public final class HostTable implements AutoCloseable {
       total += cv.getHostMemorySize();
     }
     return total;
+  }
+
+  /**
+   * copy the host-side HostTable to gpu-side Table
+   * 
+   * @param hostBuffer - a HostMemoryBuffer
+   * @param columns - Array of HostColumnVector(s)
+   * 
+   * @return a Table object
+   * 
+   * NOTE: @hostBuffer and @columns are from a ContiguousHostTable, 
+   *       all the HostColumnVector(s) must share the same single underlying HostMemoryBuffer
+   */
+  public static Table copyToDevice(HostMemoryBuffer hostBuffer, HostColumnVector[] columns) {
+    Table table = null;
+    DeviceMemoryBuffer devBuffer = null;
+    try (NvtxRange range = new NvtxRange("HostBuffers->GpuTable", NvtxColor.PURPLE)) {
+      // allocate a single devide-side buffer, and copy data from @hostBuffer
+      devBuffer = DeviceMemoryBuffer.allocate(hostBuffer.getLength());
+      devBuffer.copyFromHostBuffer(hostBuffer);
+
+      // build column layout based-on the host-side buffer and then slice the device-side buffer into mulltiple columns, 
+      // finally warp them into a Table
+      ColumnInfo[] columnInfo = buildLayout(hostBuffer, columns);
+      table = buildTableBasedonLayoutInfo(devBuffer, columnInfo);
+    } finally {
+      if (devBuffer != null) {
+        devBuffer.close();
+      }
+    }
+
+    return table;
+  }
+
+  private static final class ColumnInfo {
+    private final DType type;
+    private final long nullCount;
+    private final long numRows;
+    private final long validity;    // the validity buffer's offset in the underlying buffer
+    private final long validityLen; // the validity buffer's length
+    private final long offsets;
+    private final long offsetsLen;
+    private final long data;
+    private final long dataLen;
+
+    public ColumnInfo(DType type, long nullCount, long numRows,
+                      long validity, long validityLen,
+                      long offsets, long offsetsLen,
+                      long data, long dataLen) {
+      this.type = type;
+      this.nullCount = nullCount;
+      this.numRows = numRows;
+      this.validity = validity;
+      this.validityLen = validityLen;
+      this.offsets = offsets;
+      this.offsetsLen = offsetsLen;
+      this.data = data;
+      this.dataLen = dataLen;
+    }
+
+    // NOTE: this class does not take into account the `children`, so we do not support nested type, i.e. LIST, STRUCT
+    //       this version's cuDF itself does not support nested type too, see JCudfSerialization.java:buildIndex() for more detailed info
+  }
+
+  private static ColumnInfo[] buildLayout(HostMemoryBuffer hostBuffer, HostColumnVector... columns) {
+    long bufferAddress = hostBuffer.getAddress();
+    int numColumns = columns.length;
+    
+    ColumnInfo[] ci = new ColumnInfo[numColumns];
+    for (int i = 0; i < numColumns; ++i) {
+      DType type = columns[i].getDataType();
+      long nullCount = columns[i].getNullCount();
+      long numRows = columns[i].getNumRows();
+      long validity = 0;
+      long validityLen = 0;
+      long offsets = 0;
+      long offsetsLen = 0;
+      long data = 0;
+      long dataLen = 0;
+
+      HostMemoryBuffer buf = null;
+     
+      buf = columns[i].getValidityBuffer();
+      if (buf != null) {
+        validity = buf.getAddress() - bufferAddress;
+        validityLen = buf.getLength();
+      }
+
+      buf = columns[i].getOffsetBuffer();
+      if (buf != null) {
+        offsets = buf.getAddress() - bufferAddress;
+        offsetsLen = buf.getLength();
+      }
+
+      buf = columns[i].getDataBuffer(); 
+      if (buf != null) {
+        data = buf.getAddress() - bufferAddress;
+        dataLen = buf.getLength();
+      }
+
+      ci[i] = new ColumnInfo(type, nullCount, numRows, validity, validityLen, offsets, offsetsLen, data, dataLen);
+    }
+
+    return ci;
+  }
+
+  private static Table buildTableBasedonLayoutInfo(DeviceMemoryBuffer devBuffer, ColumnInfo... columns) {
+    int numColumns = columns.length;
+    long numRows = columns[0].numRows;
+
+    ColumnVector[] vectors = new ColumnVector[numColumns];
+    DeviceMemoryBuffer validity = null;
+    DeviceMemoryBuffer data = null;
+    DeviceMemoryBuffer offsets = null;
+    try {
+      for (int i = 0; i < numColumns; i++) {
+        ColumnInfo ci = columns[i];
+        DType type = ci.type;
+        long nullCount = ci.nullCount;
+
+        if (ci.validityLen > 0) {
+          validity = devBuffer.slice(ci.validity, ci.validityLen);
+        }
+
+        if (ci.offsetsLen > 0) {
+          offsets = devBuffer.slice(ci.offsets, ci.offsetsLen);
+        }
+
+        if (ci.dataLen > 0) {
+          data = devBuffer.slice(ci.data, ci.dataLen);
+        }
+
+        vectors[i] = new ColumnVector(type, numRows, Optional.of(nullCount), data, validity, offsets);
+        validity = null;
+        data = null;
+        offsets = null;
+      }
+      return new Table(vectors);
+    } finally {
+      if (validity != null) {
+        validity.close();
+      }
+
+      if (data != null) {
+        data.close();
+      }
+
+      if (offsets != null) {
+        offsets.close();
+      }
+
+      for (ColumnVector cv: vectors) {
+        if (cv != null) {
+          cv.close();
+        }
+      }
+    }
   }
 }
